@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <tlHelp32.h>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -6,18 +7,24 @@
 #include <sstream>
 #include <Shlwapi.h>
 
-// Function to redirect cout and cerr to a log file
-void redirectLogToFile(const std::string& filename) {
-    // Save the original cout and cerr buffers
-    std::streambuf* coutBuf = std::cout.rdbuf();
-    std::streambuf* cerrBuf = std::cerr.rdbuf();
 
-    // Open the log file
-    std::ofstream logFile(filename);
+std::ofstream logFile;  // Declare logFile in the global scope
+
+
+// Function to redirect cout and cerr to a log file
+void redirectLogToFile() {
+    logFile.open("GIL.log");  // Open the log file
+    if (!logFile.is_open()) {
+        std::cerr << "Error: Failed to open the log file." << std::endl;
+        return;
+    }
 
     // Redirect cout and cerr to the log file
     std::cout.rdbuf(logFile.rdbuf());
     std::cerr.rdbuf(logFile.rdbuf());
+
+    logFile << "Log file opened successfully." << std::endl;
+    logFile << std::flush;  // Flush the log buffer
 }
 
 // Function to inject a DLL into a process
@@ -26,7 +33,7 @@ bool InjectDLL(DWORD processId, const std::string& dllPath) {
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
 
     if (hProcess == nullptr) {
-        std::cerr << "Error: Failed to open the target process." << std::endl;
+        logFile << "Error: Failed to open the target process." << std::endl;
         return false;
     }
 
@@ -34,7 +41,7 @@ bool InjectDLL(DWORD processId, const std::string& dllPath) {
     LPVOID remoteMemory = VirtualAllocEx(hProcess, nullptr, dllPath.size() + 1, MEM_COMMIT, PAGE_READWRITE);
 
     if (remoteMemory == nullptr) {
-        std::cerr << "Error: Failed to allocate memory in the target process." << std::endl;
+        logFile << "Error: Failed to allocate memory in the target process." << std::endl;
         CloseHandle(hProcess);
         return false;
     }
@@ -46,7 +53,7 @@ bool InjectDLL(DWORD processId, const std::string& dllPath) {
     LPVOID loadLibraryAddress = GetProcAddress(GetModuleHandle("kernel32.dll"), "LoadLibraryA");
 
     if (loadLibraryAddress == nullptr) {
-        std::cerr << "Error: Failed to get the address of LoadLibraryA." << std::endl;
+        logFile << "Error: Failed to get the address of LoadLibraryA." << std::endl;
         VirtualFreeEx(hProcess, remoteMemory, 0, MEM_RELEASE);
         CloseHandle(hProcess);
         return false;
@@ -57,7 +64,7 @@ bool InjectDLL(DWORD processId, const std::string& dllPath) {
                                         remoteMemory, 0, nullptr);
 
     if (hThread == nullptr) {
-        std::cerr << "Error: Failed to create a remote thread." << std::endl;
+        logFile << "Error: Failed to create a remote thread." << std::endl;
         VirtualFreeEx(hProcess, remoteMemory, 0, MEM_RELEASE);
         CloseHandle(hProcess);
         return false;
@@ -74,38 +81,61 @@ bool InjectDLL(DWORD processId, const std::string& dllPath) {
     return true;
 }
 
+
+bool LaunchProcess(const std::string& processPath) {
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+
+    ZeroMemory(&si, sizeof(STARTUPINFOA));
+    si.cb = sizeof(STARTUPINFOA);
+
+    if (!CreateProcessA(nullptr, const_cast<char*>(processPath.c_str()), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        logFile << "Error: Failed to launch the process. Error code: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
+}
+
 // Function to parse an INI file and retrieve configuration data
 bool ReadConfig(const std::string& iniPath, std::string& processName, std::string& dllPath) {
     char buffer[MAX_PATH];
 
-    GetPrivateProfileString("Config", "ProcessName", "", buffer, sizeof(buffer), iniPath.c_str());
+    if (GetPrivateProfileStringA("Config", "ProcessName", "", buffer, sizeof(buffer), iniPath.c_str()) == 0) {
+        logFile << "Error: Failed to read 'ProcessName' from the INI file. Section or key not found." << std::endl;
+        return false;
+    }
     processName = buffer;
 
-    GetPrivateProfileString("Config", "DllPath", "", buffer, sizeof(buffer), iniPath.c_str());
+    if (GetPrivateProfileStringA("Config", "DllPath", "", buffer, sizeof(buffer), iniPath.c_str()) == 0) {
+        logFile << "Error: Failed to read 'DllPath' from the INI file. Section or key not found." << std::endl;
+        return false;
+    }
     dllPath = buffer;
 
     return !processName.empty() && !dllPath.empty();
 }
 
 int main() {
-    // Example INI file path
-    std::string iniPath = "GIL.ini";
+	
+	char buffer[MAX_PATH];
+	GetCurrentDirectory(MAX_PATH, buffer);
+	std::string iniPath = std::string(buffer) + "\\GIL.ini";
 
-    // Read configuration from the INI file
+    redirectLogToFile();
+
     std::string processName, dllPath;
 
     if (!ReadConfig(iniPath, processName, dllPath)) {
-        std::cerr << "Error: Failed to read configuration from the INI file." << std::endl;
+        logFile << "Error: Failed to read configuration from the INI file." << std::endl;
         return 1;
     }
 
-    // Example target process name
     const char* targetProcessName = processName.c_str();
-
-    // Example DLL path
     const std::string injectDllPath = dllPath;
 
-    // Get the process ID of the target process
     DWORD processId = 0;
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     PROCESSENTRY32 processEntry;
@@ -123,15 +153,41 @@ int main() {
     CloseHandle(snapshot);
 
     if (processId == 0) {
-        std::cerr << "Error: Target process not found." << std::endl;
-        return 1;
+        logFile << "Target process not found. Launching..." << std::endl;
+        if (!LaunchProcess(targetProcessName)) {
+            logFile << "Error: Failed to launch the target process." << std::endl;
+            return 1;
+        }
+
+        // Wait for the process to start
+        Sleep(5000);
+
+        // Retrieve the process ID again
+        snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        processEntry.dwSize = sizeof(PROCESSENTRY32);
+
+        if (Process32First(snapshot, &processEntry)) {
+            do {
+                if (_stricmp(processEntry.szExeFile, targetProcessName) == 0) {
+                    processId = processEntry.th32ProcessID;
+                    break;
+                }
+            } while (Process32Next(snapshot, &processEntry));
+        }
+
+        CloseHandle(snapshot);
+
+        if (processId == 0) {
+            logFile << "Error: Unable to find or launch the target process." << std::endl;
+            return 1;
+        }
     }
 
     // Inject the DLL into the target process
     if (InjectDLL(processId, injectDllPath)) {
-        std::cout << "DLL injected successfully!" << std::endl;
+        logFile << "DLL injected successfully!" << std::endl;
     } else {
-        std::cerr << "Error: DLL injection failed." << std::endl;
+        logFile << "Error: DLL injection failed." << std::endl;
         return 1;
     }
 
